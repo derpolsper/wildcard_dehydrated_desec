@@ -26,6 +26,10 @@ desec_authorization_header() {
   echo "Authorization: Token ${DESEC_TOKEN}"
 }
 
+#####
+##### Patched by cursor
+#####
+
 desec_add_rrset() {
   local domainname="$1"
   local subdomain="$2"
@@ -34,36 +38,90 @@ desec_add_rrset() {
   local ttl="${5:-${MIN_TTL}}"
 
   local curl_http_code
+  local existing_records
+  local new_records_json
+  local rrset_url
+  local found=false
 
   if [ "${ttl}" -lt ${MIN_TTL} ]; then
     echo "TTL must be at least ${MIN_TTL} s. Adjusting." >&2
     ttl=${MIN_TTL}
   fi
 
-  if [ "${rrtype}" = "TXT" ] && [ "${content:0-1}" != '"' ]; then
-    content='\"'"${content}"'\"'
+  # For TXT, ensure value is wrapped in double quotes (for deSEC API)
+  if [ "${rrtype}" = "TXT" ]; then
+    # Remove any existing wrapping quotes
+    content=$(printf %s "$content" | sed 's/^"//;s/"$//')
+    # Wrap in double quotes for deSEC
+    content="\"${content}\""
   fi
+
+  echo "DEBUG: content=$content"
+  printf '%s\n' "$content" | jq -R . | jq -s .
 
   curl_temp_file=$(mktemp)
   trap 'remove_curl_temp_file' EXIT
 
   echo "Adding ${subdomain}${DOMAIN_SEPARATOR}${domainname}"
 
-  curl_http_code=$(curl -sS \
-    --output "${curl_temp_file}" \
-    --write-out "%{http_code}" \
-    --request POST \
-    --header "$(desec_authorization_header)" \
-    --header "Content-Type: application/json" \
-    --data "{\"subname\": \"${subdomain}\", \"type\": \"${rrtype}\", \"ttl\": ${ttl}, \"records\": [\"${content}\"]}" \
-    "${BASE_API_URL}/${domainname}/rrsets/")
+  rrset_url="${BASE_API_URL}/${domainname}/rrsets/${subdomain}/${rrtype}/"
 
-  if [ "${curl_http_code}" != "201" ]; then
-    echo "Adding record failed:"
-    jq . <"${curl_temp_file}"
-    exit 1
+  # Try to fetch existing RRset
+  existing_records=$(curl -sS \
+    --header "$(desec_authorization_header)" \
+    "${rrset_url}" | jq -r '.records // empty')
+
+  if [ -n "${existing_records}" ] && [ "${existing_records}" != "null" ]; then
+    # Remove brackets and split into array (do NOT strip quotes)
+    mapfile -t records_array < <(echo "${existing_records}" | jq -r '.[]')
+    # Check if content already present (quoted)
+    for rec in "${records_array[@]}"; do
+      if [ "$rec" = "$content" ]; then
+        found=true
+        break
+      fi
+    done
+    if [ "$found" = false ]; then
+      records_array+=("$content")
+    fi
+    # Build new records JSON, do NOT add extra quotes
+    new_records_json=$(printf '%s\n' "${records_array[@]}" | jq -R . | jq -s .)
+    # Update RRset with PUT
+    curl_http_code=$(curl -sS \
+      --output "${curl_temp_file}" \
+      --write-out "%{http_code}" \
+      --request PUT \
+      --header "$(desec_authorization_header)" \
+      --header "Content-Type: application/json" \
+      --data "{\"subname\": \"${subdomain}\", \"type\": \"${rrtype}\", \"ttl\": ${ttl}, \"records\": ${new_records_json}}" \
+      "${rrset_url}")
+    if [ "${curl_http_code}" != "200" ]; then
+      echo "Updating record failed:"
+      jq . <"${curl_temp_file}"
+      exit 1
+    fi
+  else
+    # No existing RRset, create new with POST, do NOT add extra quotes
+    new_records_json=$(printf '%s\n' "$content" | jq -R . | jq -s .)
+    curl_http_code=$(curl -sS \
+      --output "${curl_temp_file}" \
+      --write-out "%{http_code}" \
+      --request POST \
+      --header "$(desec_authorization_header)" \
+      --header "Content-Type: application/json" \
+      --data "{\"subname\": \"${subdomain}\", \"type\": \"${rrtype}\", \"ttl\": ${ttl}, \"records\": ${new_records_json} }" \
+      "${BASE_API_URL}/${domainname}/rrsets/")
+    if [ "${curl_http_code}" != "201" ]; then
+      echo "Adding record failed:"
+      jq . <"${curl_temp_file}"
+      exit 1
+    fi
   fi
 }
+
+#####
+##### End of cursor
+#####
 
 desec_remove_rrset() {
   local domainname="$1"
